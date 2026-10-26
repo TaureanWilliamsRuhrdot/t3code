@@ -1,6 +1,7 @@
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as SourceControlProviderRegistry from "../sourceControl/SourceControlProviderRegistry.ts";
+import { resolveJiraTickets } from "./JiraTickets.ts";
 
 const encodeSubject = Schema.encodeEffect(
   Schema.fromJsonString(Schema.Struct({ title: Schema.String, body: Schema.String })),
@@ -40,5 +41,7 @@ export const resolveThreadTitleLinks = Effect.fn("resolveThreadTitleLinks")(func
       ),
     { concurrency: 2 },
   );
-  return subjects.length > 0 ? subjects.join("\n\n") : undefined;
+  const jira = yield* resolveJiraTickets(input.message);
+  const all = jira === undefined ? subjects : [...subjects, jira];
+  return all.length > 0 ? all.join("\n\n") : undefined;
 });
