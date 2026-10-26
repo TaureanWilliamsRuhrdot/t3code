@@ -21,7 +21,12 @@ import { readPreparedConnection } from "~/state/session";
 
 import { isLocalLoopbackHost, normalizeHostname } from "./browser/browserTargetResolver";
 import { useComposerDraftStore } from "./composerDraftStore";
-import { getClientSettings, useClientSettings } from "./hooks/useSettings";
+import {
+  ensureClientSettingsHydrated,
+  getClientSettings,
+  isClientSettingsHydrated,
+  useClientSettings,
+} from "./hooks/useSettings";
 import { resolveStorage } from "./lib/storage";
 import {
   deriveLogicalProjectKeyFromSettings,
@@ -366,20 +371,28 @@ function deriveHistoryProjectKey(
 function readThreadProjectRef(ref: ScopedThreadRef): ScopedProjectRef | null {
   const projectId = readThreadShell(ref)?.projectId;
   if (projectId) return scopeProjectRef(ref.environmentId, projectId);
-  const draft = useComposerDraftStore.getState().draftThreadsByThreadKey[scopedThreadKey(ref)];
+  const draft = useComposerDraftStore.getState().getDraftSessionByRef(ref);
   return draft ? scopeProjectRef(draft.environmentId, draft.projectId) : null;
 }
 
 /**
- * Registers the thread under its current project so earlier visits and titles
- * land. A thread whose project is not loaded yet keeps its last registration,
- * or none, and its writes wait in the pending queues.
+ * Registers the thread under its current project so queued visits and titles
+ * land. Until the project loads, or client settings hydrate (the grouping is
+ * unknown before then), the last registration stands and writes stay queued.
  */
 function resolveThreadProjectKey(ref: ScopedThreadRef): string | undefined {
+  const state = useBrowserHistoryStore.getState();
+  const registered = state.projectKeyByThreadKey[scopedThreadKey(ref)];
+  if (!isClientSettingsHydrated()) {
+    void ensureClientSettingsHydrated().then(
+      () => resolveThreadProjectKey(ref),
+      () => undefined,
+    );
+    return registered;
+  }
   const projectRef = readThreadProjectRef(ref);
   const project = projectRef ? readProject(projectRef) : null;
-  const state = useBrowserHistoryStore.getState();
-  if (!project) return state.projectKeyByThreadKey[scopedThreadKey(ref)];
+  if (!project) return registered;
   const projectKey = deriveHistoryProjectKey(
     project,
     readProjects(),
@@ -444,7 +457,7 @@ function useThreadHistoryProjectKey(ref: ScopedThreadRef): string | null {
   const threadKey = scopedThreadKey(ref);
   const shellProjectId = useQuietThreadShell(ref)?.projectId ?? null;
   const draftProjectKey = useComposerDraftStore((state) => {
-    const draft = state.draftThreadsByThreadKey[threadKey];
+    const draft = state.getDraftSessionByRef(ref);
     return draft ? scopedProjectKey(scopeProjectRef(draft.environmentId, draft.projectId)) : null;
   });
   const projectKey = shellProjectId

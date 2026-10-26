@@ -1,12 +1,18 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
+import { scopeProjectRef } from "@t3tools/client-runtime/environment";
 import { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
 
-const { readPreparedConnection, entities } = vi.hoisted(() => ({
+const { readPreparedConnection, entities, settingsHydration } = vi.hoisted(() => ({
   readPreparedConnection: vi.fn<() => { httpBaseUrl: string } | null>(() => null),
   entities: {
     projects: [] as Array<Record<string, unknown>>,
     shellProjectId: null as string | null,
+  },
+  settingsHydration: {
+    hydrated: true,
+    finish: () => {},
+    promise: Promise.resolve(),
   },
 }));
 
@@ -26,6 +32,8 @@ vi.mock("./hooks/useSettings", async () => {
   return {
     getClientSettings: () => DEFAULT_CLIENT_SETTINGS,
     useClientSettings: () => DEFAULT_CLIENT_SETTINGS,
+    isClientSettingsHydrated: () => settingsHydration.hydrated,
+    ensureClientSettingsHydrated: () => settingsHydration.promise,
   };
 });
 vi.mock("~/state/environments", () => ({
@@ -33,6 +41,7 @@ vi.mock("~/state/environments", () => ({
   usePrimaryEnvironmentId: () => null,
 }));
 
+import { DraftId, useComposerDraftStore } from "./composerDraftStore";
 import {
   BROWSER_HISTORY_MAX_PROJECTS,
   type BrowserHistoryEntry,
@@ -54,6 +63,9 @@ beforeEach(() => {
   readPreparedConnection.mockReturnValue(null);
   entities.projects = [];
   entities.shellProjectId = null;
+  settingsHydration.hydrated = true;
+  settingsHydration.promise = Promise.resolve();
+  useComposerDraftStore.setState({ draftThreadsByThreadKey: {} });
 });
 afterEach(() => vi.restoreAllMocks());
 
@@ -195,6 +207,14 @@ describe("useBrowserHistoryStore", () => {
   });
 });
 
+const repoProject = {
+  environmentId: EnvironmentId.make("env-1"),
+  id: ProjectId.make("project-1"),
+  workspaceRoot: "/repo",
+  repositoryIdentity: null,
+  isScratch: false,
+};
+
 describe("thread project resolution", () => {
   beforeEach(() => {
     resetBrowserHistoryForTests();
@@ -220,6 +240,45 @@ describe("thread project resolution", () => {
     });
     expect(useBrowserHistoryStore.getState().pendingVisitsByThreadKey).toEqual({});
     expect(useBrowserHistoryStore.getState().pendingTitlesByThreadKey).toEqual({});
+  });
+
+  it("files a draft thread's visits under the draft's project", () => {
+    entities.projects = [repoProject];
+    const projectRef = scopeProjectRef(EnvironmentId.make("env-1"), ProjectId.make("project-1"));
+    useComposerDraftStore
+      .getState()
+      .setLogicalProjectDraftThreadId("env-1:/repo", projectRef, DraftId.make("draft-1"), {
+        threadId: threadRef.threadId,
+      });
+
+    recordVisitForThread(threadRef, "http://localhost:5173/", 1);
+
+    expect(useBrowserHistoryStore.getState().byProjectKey).toEqual({
+      "env-1:/repo": [{ url: "http://localhost:5173/", lastVisitedAt: 1 }],
+    });
+    expect(useBrowserHistoryStore.getState().pendingVisitsByThreadKey).toEqual({});
+  });
+
+  it("waits for client settings before filing a thread under its project", async () => {
+    entities.projects = [repoProject];
+    entities.shellProjectId = "project-1";
+    settingsHydration.hydrated = false;
+    settingsHydration.promise = new Promise<void>((resolve) => {
+      settingsHydration.finish = () => {
+        settingsHydration.hydrated = true;
+        resolve();
+      };
+    });
+
+    recordVisitForThread(threadRef, "http://localhost:5173/", 1);
+    expect(useBrowserHistoryStore.getState().projectKeyByThreadKey).toEqual({});
+
+    settingsHydration.finish();
+    await settingsHydration.promise;
+    expect(useBrowserHistoryStore.getState().byProjectKey).toEqual({
+      "env-1:/repo": [{ url: "http://localhost:5173/", lastVisitedAt: 1 }],
+    });
+    expect(useBrowserHistoryStore.getState().pendingVisitsByThreadKey).toEqual({});
   });
 
   it("lands visits queued before the thread's project loaded with the next visit", () => {
