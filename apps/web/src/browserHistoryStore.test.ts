@@ -8,7 +8,7 @@ const { readPreparedConnection, entities, settingsHydration } = vi.hoisted(() =>
   entities: {
     projects: [] as Array<Record<string, unknown>>,
     shellProjectId: null as string | null,
-    shellArrived: new Promise<boolean>(() => {}),
+    waitForThreadShell: (): Promise<boolean> => new Promise(() => {}),
   },
   settingsHydration: {
     hydrated: true,
@@ -27,7 +27,7 @@ vi.mock("~/state/entities", () => ({
   readProjects: () => entities.projects,
   useProjects: () => entities.projects,
   useQuietThreadShell: () => null,
-  waitForThreadShell: () => entities.shellArrived,
+  waitForThreadShell: () => entities.waitForThreadShell(),
   waitForProject: () => new Promise(() => {}),
 }));
 vi.mock("./hooks/useSettings", async () => {
@@ -66,7 +66,7 @@ beforeEach(() => {
   readPreparedConnection.mockReturnValue(null);
   entities.projects = [];
   entities.shellProjectId = null;
-  entities.shellArrived = new Promise<boolean>(() => {});
+  entities.waitForThreadShell = () => new Promise(() => {});
   settingsHydration.hydrated = true;
   settingsHydration.promise = Promise.resolve();
   useComposerDraftStore.setState({ draftThreadsByThreadKey: {} });
@@ -304,22 +304,38 @@ describe("thread project resolution", () => {
     ).toEqual(["http://b.test/", "http://a.test/"]);
   });
 
-  it("lands a visit queued before the thread loaded once the thread arrives", async () => {
-    let shellArrives = (_found: boolean) => {};
-    entities.shellArrived = new Promise<boolean>((resolve) => {
-      shellArrives = resolve;
+  it("lands visits queued before the thread loaded when the thread arrives after a timed-out wait", async () => {
+    const waits: Array<(found: boolean) => void> = [];
+    let retried = () => {};
+    const retry = new Promise<void>((resolve) => {
+      retried = resolve;
+    });
+    entities.waitForThreadShell = () =>
+      new Promise<boolean>((resolve) => {
+        waits.push(resolve);
+        if (waits.length === 2) retried();
+      });
+    const landed = new Promise<void>((resolve) => {
+      const unsubscribe = useBrowserHistoryStore.subscribe((state) => {
+        if (!state.byProjectKey["env-1:/repo"]) return;
+        unsubscribe();
+        resolve();
+      });
     });
     recordVisitForThread(threadRef, "http://a.test/", 1);
-    expect(useBrowserHistoryStore.getState().byProjectKey).toEqual({});
+    recordVisitForThread(threadRef, "http://b.test/", 2);
+    expect(waits).toHaveLength(1);
 
+    waits[0]?.(false);
+    await retry;
     entities.projects = [repoProject];
     entities.shellProjectId = "project-1";
-    shellArrives(true);
-    await entities.shellArrived;
+    waits[1]?.(true);
+    await landed;
 
-    expect(useBrowserHistoryStore.getState().byProjectKey).toEqual({
-      "env-1:/repo": [{ url: "http://a.test/", lastVisitedAt: 1 }],
-    });
+    expect(
+      useBrowserHistoryStore.getState().byProjectKey["env-1:/repo"]?.map((entry) => entry.url),
+    ).toEqual(["http://b.test/", "http://a.test/"]);
     expect(useBrowserHistoryStore.getState().pendingVisitsByThreadKey).toEqual({});
   });
 });

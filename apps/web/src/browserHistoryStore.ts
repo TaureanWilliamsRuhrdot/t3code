@@ -377,6 +377,31 @@ function readThreadProjectRef(ref: ScopedThreadRef): ScopedProjectRef | null {
   return draft ? scopeProjectRef(draft.environmentId, draft.projectId) : null;
 }
 
+const awaitingThreadKeys = new Set<string>();
+
+/** Waits keep timing out and retrying while writes are queued, so a slow load still lands them. */
+function awaitThreadProject(ref: ScopedThreadRef, projectRef: ScopedProjectRef | null): void {
+  const threadKey = scopedThreadKey(ref);
+  if (awaitingThreadKeys.has(threadKey)) return;
+  awaitingThreadKeys.add(threadKey);
+  const arrived = projectRef
+    ? waitForProject(projectRef).then(() => true)
+    : waitForThreadShell(ref);
+  void arrived
+    .catch(() => false)
+    .then((found) => {
+      awaitingThreadKeys.delete(threadKey);
+      const state = useBrowserHistoryStore.getState();
+      if (
+        found ||
+        state.pendingVisitsByThreadKey[threadKey] ||
+        state.pendingTitlesByThreadKey[threadKey]
+      ) {
+        resolveThreadProjectKey(ref);
+      }
+    });
+}
+
 /**
  * Registers the thread under its current project so queued visits and titles
  * land. Until the project loads, or client settings hydrate (the grouping is
@@ -396,13 +421,7 @@ function resolveThreadProjectKey(ref: ScopedThreadRef): string | undefined {
   const projectRef = readThreadProjectRef(ref);
   const project = projectRef ? readProject(projectRef) : null;
   if (!project) {
-    if (registered === undefined) {
-      const arrived = projectRef ? waitForProject(projectRef) : waitForThreadShell(ref);
-      void arrived.then(
-        (found) => (found ? resolveThreadProjectKey(ref) : undefined),
-        () => undefined,
-      );
-    }
+    if (registered === undefined) awaitThreadProject(ref, projectRef);
     return registered;
   }
   const projectKey = deriveHistoryProjectKey(
@@ -504,6 +523,7 @@ export function useThreadRecentHistory(
 }
 
 export function resetBrowserHistoryForTests(): void {
+  awaitingThreadKeys.clear();
   useBrowserHistoryStore.setState({
     byProjectKey: {},
     projectKeyByThreadKey: {},
