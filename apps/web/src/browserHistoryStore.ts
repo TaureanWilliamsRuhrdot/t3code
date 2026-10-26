@@ -15,6 +15,8 @@ import {
   readThreadShell,
   useProjects,
   useQuietThreadShell,
+  waitForProject,
+  waitForThreadShell,
 } from "~/state/entities";
 import { readPrimaryEnvironmentId, usePrimaryEnvironmentId } from "~/state/environments";
 import { readPreparedConnection } from "~/state/session";
@@ -378,7 +380,8 @@ function readThreadProjectRef(ref: ScopedThreadRef): ScopedProjectRef | null {
 /**
  * Registers the thread under its current project so queued visits and titles
  * land. Until the project loads, or client settings hydrate (the grouping is
- * unknown before then), the last registration stands and writes stay queued.
+ * unknown before then), the last registration stands and writes stay queued
+ * until whichever is missing arrives.
  */
 function resolveThreadProjectKey(ref: ScopedThreadRef): string | undefined {
   const state = useBrowserHistoryStore.getState();
@@ -392,7 +395,16 @@ function resolveThreadProjectKey(ref: ScopedThreadRef): string | undefined {
   }
   const projectRef = readThreadProjectRef(ref);
   const project = projectRef ? readProject(projectRef) : null;
-  if (!project) return registered;
+  if (!project) {
+    if (registered === undefined) {
+      const arrived = projectRef ? waitForProject(projectRef) : waitForThreadShell(ref);
+      void arrived.then(
+        (found) => (found ? resolveThreadProjectKey(ref) : undefined),
+        () => undefined,
+      );
+    }
+    return registered;
+  }
   const projectKey = deriveHistoryProjectKey(
     project,
     readProjects(),

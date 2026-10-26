@@ -8,6 +8,7 @@ const { readPreparedConnection, entities, settingsHydration } = vi.hoisted(() =>
   entities: {
     projects: [] as Array<Record<string, unknown>>,
     shellProjectId: null as string | null,
+    shellArrived: new Promise<boolean>(() => {}),
   },
   settingsHydration: {
     hydrated: true,
@@ -26,6 +27,8 @@ vi.mock("~/state/entities", () => ({
   readProjects: () => entities.projects,
   useProjects: () => entities.projects,
   useQuietThreadShell: () => null,
+  waitForThreadShell: () => entities.shellArrived,
+  waitForProject: () => new Promise(() => {}),
 }));
 vi.mock("./hooks/useSettings", async () => {
   const { DEFAULT_CLIENT_SETTINGS } = await import("@t3tools/contracts/settings");
@@ -63,6 +66,7 @@ beforeEach(() => {
   readPreparedConnection.mockReturnValue(null);
   entities.projects = [];
   entities.shellProjectId = null;
+  entities.shellArrived = new Promise<boolean>(() => {});
   settingsHydration.hydrated = true;
   settingsHydration.promise = Promise.resolve();
   useComposerDraftStore.setState({ draftThreadsByThreadKey: {} });
@@ -298,6 +302,25 @@ describe("thread project resolution", () => {
     expect(
       useBrowserHistoryStore.getState().byProjectKey["env-1:/repo"]?.map((entry) => entry.url),
     ).toEqual(["http://b.test/", "http://a.test/"]);
+  });
+
+  it("lands a visit queued before the thread loaded once the thread arrives", async () => {
+    let shellArrives = (_found: boolean) => {};
+    entities.shellArrived = new Promise<boolean>((resolve) => {
+      shellArrives = resolve;
+    });
+    recordVisitForThread(threadRef, "http://a.test/", 1);
+    expect(useBrowserHistoryStore.getState().byProjectKey).toEqual({});
+
+    entities.projects = [repoProject];
+    entities.shellProjectId = "project-1";
+    shellArrives(true);
+    await entities.shellArrived;
+
+    expect(useBrowserHistoryStore.getState().byProjectKey).toEqual({
+      "env-1:/repo": [{ url: "http://a.test/", lastVisitedAt: 1 }],
+    });
+    expect(useBrowserHistoryStore.getState().pendingVisitsByThreadKey).toEqual({});
   });
 });
 
