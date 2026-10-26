@@ -1,12 +1,37 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-import { EnvironmentId, ThreadId } from "@t3tools/contracts";
+import { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
 
-const { readPreparedConnection } = vi.hoisted(() => ({
+const { readPreparedConnection, entities } = vi.hoisted(() => ({
   readPreparedConnection: vi.fn<() => { httpBaseUrl: string } | null>(() => null),
+  entities: {
+    projects: [] as Array<Record<string, unknown>>,
+    shellProjectId: null as string | null,
+  },
 }));
 
 vi.mock("~/state/session", () => ({ readPreparedConnection }));
+vi.mock("~/state/entities", () => ({
+  readThreadShell: () => (entities.shellProjectId ? { projectId: entities.shellProjectId } : null),
+  readProject: (ref: { environmentId: string; projectId: string }) =>
+    entities.projects.find(
+      (project) => project.environmentId === ref.environmentId && project.id === ref.projectId,
+    ) ?? null,
+  readProjects: () => entities.projects,
+  useProjects: () => entities.projects,
+  useQuietThreadShell: () => null,
+}));
+vi.mock("./hooks/useSettings", async () => {
+  const { DEFAULT_CLIENT_SETTINGS } = await import("@t3tools/contracts/settings");
+  return {
+    getClientSettings: () => DEFAULT_CLIENT_SETTINGS,
+    useClientSettings: () => DEFAULT_CLIENT_SETTINGS,
+  };
+});
+vi.mock("~/state/environments", () => ({
+  readPrimaryEnvironmentId: () => null,
+  usePrimaryEnvironmentId: () => null,
+}));
 
 import {
   BROWSER_HISTORY_MAX_PROJECTS,
@@ -25,7 +50,11 @@ function entry(overrides: Partial<BrowserHistoryEntry> = {}): BrowserHistoryEntr
   return { url: "http://localhost:3000/", lastVisitedAt: 1000, ...overrides };
 }
 
-beforeEach(() => readPreparedConnection.mockReturnValue(null));
+beforeEach(() => {
+  readPreparedConnection.mockReturnValue(null);
+  entities.projects = [];
+  entities.shellProjectId = null;
+});
 afterEach(() => vi.restoreAllMocks());
 
 describe("normalizeHistoryUrl", () => {
@@ -163,6 +192,53 @@ describe("useBrowserHistoryStore", () => {
     expect(useBrowserHistoryStore.getState().byProjectKey["proj-a"]).toEqual([
       { url: "http://localhost:5173/app", lastVisitedAt: 5 },
     ]);
+  });
+});
+
+describe("thread project resolution", () => {
+  beforeEach(() => {
+    resetBrowserHistoryForTests();
+  });
+
+  it("files a browser tab's visits and titles under the thread's project with no view registering it", () => {
+    entities.projects = [
+      {
+        environmentId: EnvironmentId.make("env-1"),
+        id: ProjectId.make("project-1"),
+        workspaceRoot: "/repo",
+        repositoryIdentity: null,
+        isScratch: false,
+      },
+    ];
+    entities.shellProjectId = "project-1";
+
+    recordVisitForThread(threadRef, "http://localhost:5173/", 1);
+    setTitleForThreadUrl(threadRef, "http://localhost:5173/", "Dev App");
+
+    expect(useBrowserHistoryStore.getState().byProjectKey).toEqual({
+      "env-1:/repo": [{ url: "http://localhost:5173/", lastVisitedAt: 1, title: "Dev App" }],
+    });
+    expect(useBrowserHistoryStore.getState().pendingVisitsByThreadKey).toEqual({});
+    expect(useBrowserHistoryStore.getState().pendingTitlesByThreadKey).toEqual({});
+  });
+
+  it("lands visits queued before the thread's project loaded with the next visit", () => {
+    recordVisitForThread(threadRef, "http://a.test/", 1);
+    entities.projects = [
+      {
+        environmentId: EnvironmentId.make("env-1"),
+        id: ProjectId.make("project-1"),
+        workspaceRoot: "/repo",
+        repositoryIdentity: null,
+        isScratch: false,
+      },
+    ];
+    entities.shellProjectId = "project-1";
+    recordVisitForThread(threadRef, "http://b.test/", 2);
+
+    expect(
+      useBrowserHistoryStore.getState().byProjectKey["env-1:/repo"]?.map((entry) => entry.url),
+    ).toEqual(["http://b.test/", "http://a.test/"]);
   });
 });
 

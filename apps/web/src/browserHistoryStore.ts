@@ -1,14 +1,36 @@
-import { scopedThreadKey } from "@t3tools/client-runtime/environment";
-import type { ScopedThreadRef } from "@t3tools/contracts";
+import {
+  scopedProjectKey,
+  scopedThreadKey,
+  scopeProjectRef,
+} from "@t3tools/client-runtime/environment";
+import type { EnvironmentId, ScopedProjectRef, ScopedThreadRef } from "@t3tools/contracts";
 import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
 import { useShallow } from "zustand/react/shallow";
 
 import { normalizePreviewUrl } from "@t3tools/shared/preview";
+import {
+  readProject,
+  readProjects,
+  readThreadShell,
+  useProjects,
+  useQuietThreadShell,
+} from "~/state/entities";
+import { readPrimaryEnvironmentId, usePrimaryEnvironmentId } from "~/state/environments";
 import { readPreparedConnection } from "~/state/session";
 
 import { isLocalLoopbackHost, normalizeHostname } from "./browser/browserTargetResolver";
+import { useComposerDraftStore } from "./composerDraftStore";
+import { getClientSettings, useClientSettings } from "./hooks/useSettings";
 import { resolveStorage } from "./lib/storage";
+import {
+  deriveLogicalProjectKeyFromSettings,
+  derivePhysicalProjectKey,
+  selectProjectGroupingSettings,
+  type ProjectGroupingSettings,
+} from "./logicalProject";
+import { buildPhysicalToLogicalProjectKeyMap } from "./sidebarProjectGrouping";
+import type { Project } from "./types";
 
 export type BrowserHistoryEntry = { url: string; lastVisitedAt: number; title?: string };
 
@@ -323,10 +345,55 @@ function migratePersistedThreadProjectKeys(
   );
 }
 
+/**
+ * History follows the sidebar's project rows, so a duplicate row shares the
+ * history of the group it is listed under rather than keying by its own path.
+ */
+function deriveHistoryProjectKey(
+  project: Project,
+  projects: ReadonlyArray<Project>,
+  settings: ProjectGroupingSettings,
+  primaryEnvironmentId: EnvironmentId | null,
+): string {
+  return (
+    buildPhysicalToLogicalProjectKeyMap({ projects, settings, primaryEnvironmentId }).get(
+      derivePhysicalProjectKey(project),
+    ) ?? deriveLogicalProjectKeyFromSettings(project, settings)
+  );
+}
+
+/** Server threads name their project in the shell; drafts in the composer draft store. */
+function readThreadProjectRef(ref: ScopedThreadRef): ScopedProjectRef | null {
+  const projectId = readThreadShell(ref)?.projectId;
+  if (projectId) return scopeProjectRef(ref.environmentId, projectId);
+  const draft = useComposerDraftStore.getState().draftThreadsByThreadKey[scopedThreadKey(ref)];
+  return draft ? scopeProjectRef(draft.environmentId, draft.projectId) : null;
+}
+
+/**
+ * Registers the thread under its current project so earlier visits and titles
+ * land. A thread whose project is not loaded yet keeps its last registration,
+ * or none, and its writes wait in the pending queues.
+ */
+function resolveThreadProjectKey(ref: ScopedThreadRef): string | undefined {
+  const projectRef = readThreadProjectRef(ref);
+  const project = projectRef ? readProject(projectRef) : null;
+  const state = useBrowserHistoryStore.getState();
+  if (!project) return state.projectKeyByThreadKey[scopedThreadKey(ref)];
+  const projectKey = deriveHistoryProjectKey(
+    project,
+    readProjects(),
+    selectProjectGroupingSettings(getClientSettings()),
+    readPrimaryEnvironmentId(),
+  );
+  state.registerThreadProject(ref, projectKey);
+  return projectKey;
+}
+
 export function recordVisitForThread(ref: ScopedThreadRef, url: string, at?: number): void {
   const threadKey = scopedThreadKey(ref);
+  const projectKey = resolveThreadProjectKey(ref);
   const state = useBrowserHistoryStore.getState();
-  const projectKey = state.projectKeyByThreadKey[threadKey];
   const visitAt = at ?? Date.now();
   const connection = readPreparedConnection(ref.environmentId);
   const environmentHostname = connection ? new URL(connection.httpBaseUrl).hostname : null;
@@ -350,8 +417,8 @@ export function setTitleForThreadUrl(
   environmentHostname?: string | null,
 ): void {
   const threadKey = scopedThreadKey(ref);
+  const projectKey = resolveThreadProjectKey(ref);
   const state = useBrowserHistoryStore.getState();
-  const projectKey = state.projectKeyByThreadKey[threadKey];
   if (!projectKey) {
     useBrowserHistoryStore.setState({
       pendingTitlesByThreadKey: addPendingByThread(state.pendingTitlesByThreadKey, threadKey, {
@@ -366,21 +433,45 @@ export function setTitleForThreadUrl(
 }
 
 export function removeUrlForThread(ref: ScopedThreadRef, url: string): void {
-  const state = useBrowserHistoryStore.getState();
-  const projectKey = state.projectKeyByThreadKey[scopedThreadKey(ref)];
+  const projectKey = resolveThreadProjectKey(ref);
   if (!projectKey) return;
-  state.removeUrl(projectKey, url);
+  useBrowserHistoryStore.getState().removeUrl(projectKey, url);
 }
 
 const EMPTY_HISTORY: ReadonlyArray<BrowserHistoryEntry> = [];
+
+function useThreadHistoryProjectKey(ref: ScopedThreadRef): string | null {
+  const threadKey = scopedThreadKey(ref);
+  const shellProjectId = useQuietThreadShell(ref)?.projectId ?? null;
+  const draftProjectKey = useComposerDraftStore((state) => {
+    const draft = state.draftThreadsByThreadKey[threadKey];
+    return draft ? scopedProjectKey(scopeProjectRef(draft.environmentId, draft.projectId)) : null;
+  });
+  const projectKey = shellProjectId
+    ? scopedProjectKey(scopeProjectRef(ref.environmentId, shellProjectId))
+    : draftProjectKey;
+  const projects = useProjects();
+  const settings = useClientSettings(selectProjectGroupingSettings);
+  const primaryEnvironmentId = usePrimaryEnvironmentId();
+  const registered = useBrowserHistoryStore(
+    (state) => state.projectKeyByThreadKey[threadKey] ?? null,
+  );
+  const project = projects.find(
+    (candidate) =>
+      scopedProjectKey(scopeProjectRef(candidate.environmentId, candidate.id)) === projectKey,
+  );
+  return project
+    ? deriveHistoryProjectKey(project, projects, settings, primaryEnvironmentId)
+    : registered;
+}
 
 export function useThreadRecentHistory(
   ref: ScopedThreadRef,
   limit: number,
 ): ReadonlyArray<BrowserHistoryEntry> {
+  const projectKey = useThreadHistoryProjectKey(ref);
   return useBrowserHistoryStore(
     useShallow((state) => {
-      const projectKey = state.projectKeyByThreadKey[scopedThreadKey(ref)];
       const entries = projectKey ? state.byProjectKey[projectKey] : undefined;
       return entries && entries.length > 0 ? entries.slice(0, limit) : EMPTY_HISTORY;
     }),
